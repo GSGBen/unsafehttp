@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "netdb.h": "c"
+    },
+    "makefile.configureOnOpen": false
+}
