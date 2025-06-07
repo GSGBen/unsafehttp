@@ -7,7 +7,7 @@ BUILD_DIR := ./build
 SRC_DIRS := ./src
 
 CC := gcc
-CFLAGS := -std=gnu17 -Wall -Werror -I $(SRC_DIRS)
+CFLAGS := -std=gnu17 -Wall -Wextra -Wno-unused-parameter -Werror -I $(SRC_DIRS)
 CFLAGS_DEV := -g -fsanitize=address -fsanitize=leak -fsanitize=undefined
 
 SRC_FILES := $(shell find $(SRC_DIRS) -name '*.c')
