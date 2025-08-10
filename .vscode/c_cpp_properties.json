@@ -9,7 +9,18 @@
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "gnu17",
             "cppStandard": "gnu++17",
-            "intelliSenseMode": "linux-gcc-x64"
+            "intelliSenseMode": "linux-gcc-x64",
+            "compilerArgs": [
+                "-Wall",
+                "-Wextra",
+                "-Wno-unused-parameter",
+                "-Werror",
+                "-g",
+                "-fsanitize=address",
+                "-fsanitize=leak",
+                "-fsanitize=undefined "
+            ],
+            "configurationProvider": "ms-vscode.makefile-tools"
         }
     ],
     "version": 4

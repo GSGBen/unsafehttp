@@ -1,6 +1,16 @@
 {
     "files.associations": {
-        "netdb.h": "c"
+        "netdb.h": "c",
+        "stdio.h": "c"
     },
-    "makefile.configureOnOpen": false
+    "makefile.configureOnOpen": false,
+    "makefile.launchConfigurations": [
+        {
+            "cwd": "build",
+            "binaryPath": "build/unsafehttp",
+            "binaryArgs": []
+        }
+    ],
+    "C_Cpp.codeAnalysis.clangTidy.enabled": true,
+    "C_Cpp.codeAnalysis.runAutomatically": true
 }
