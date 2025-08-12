@@ -1,7 +1,22 @@
 # unsafehttp
 
-Minimal HTTP server implementation written in C, to practice C, \*nix socket programming,
-C compilation.
+Extremely minimal HTTP server implementation written in C, to practice C, \*nix
+socket programming, C compilation.
+
+## HTTP implementation
+
+RFC 9112 is a fantastic document that details the exact format of HTTP 1.1
+requests, how servers should respond to those requests, and is even written in a
+way that would make implementing a full test suite a reasonable task.
+
+This server follows almost none of that.
+
+In the interest of keeping this a fun and short side project, I've implemented
+the very bare minimum for browsers to be able to send a simple HTTP GET request
+to the server, and receive a response that lets them render a webpage. Again in
+the interest of keeping this short, I'm not following the RFC exactly. Readers
+MUST NOT hold this against the project, and SHOULD use this as motivation to
+keep some of their own side projects fun and short.
 
 ## Building
 
@@ -33,7 +48,8 @@ make run ARGS="args here passed to unsafehttp"
 
 ## Viewing HTTP request formats
 
-If you use `print_buffer()` on received data, you can get a good overview of request structures using
+If you use `print_buffer()` on received data, you can get a good overview of
+request structures using
 
 ```sh
 make run | batcat --show-all --pager=never

@@ -27,6 +27,101 @@
 // on the platform this will primarily be running on (check with `cat
 // /proc/sys/net/ipv4/tcp_rmem`)
 #define CLIENT_BUFFER_LEN 131072
+// quick max length of the `GET <path> HTTP x.y` line in a request we'll accept.
+// Suggested number from RFC 9112. Would make more sense to calculate something
+// closer to the max path length we'll generate.
+#define MAX_REQUEST_LINE_LENGTH 8000
+
+// return codes for try_parse_request_path().
+
+typedef enum
+{
+    // not enough data to determine the requested path yet
+    TPRP_NEEDMOREDATA,
+    // we have enough data to say that the request doesn't start properly. It's
+    // a bad request and the session should be closed.
+    TPRP_NOPREFIX,
+    // we've reached the maximum line length we'll try parsing, without finding
+    // a path. It's a bad request and the session should be closed.
+    TPRP_TOOLONG,
+    // we've successfully parsed the path.
+    TPRP_PARSED,
+} tprp_rv;
+/**
+ * The first part of the request, that precedes the path.
+ */
+char *http_get_prefix = "GET ";
+int http_get_prefix_len = 4;
+
+/**
+ * A HTTP request/response section. A pointer to one of these is passed to each
+ * connection entry stored in our epoll instance. Allows us to buffer data
+ * across multiple epoll loops as we wait for it all to come in or go out.
+ *
+ * We also re-use this for listen sockets monitored via epoll, as they only need
+ * the fd. If they had differing fields we could create another struct that
+ * started with an `int fd` member, then union them.
+ *
+ * Construct with session_new().
+ *
+ * Strings are not NUL-terminated, use the related length var.
+ */
+typedef struct
+{
+    // the socket fd this session is associated with. epoll's fd and data
+    // storage is a union, so we have to re-include it now that we're asking
+    // epoll to track custom data for us.
+    int fd;
+
+    // the HTTP request text.
+    char *request;
+    // number of chars in request so far.
+    size_t request_len;
+    // if request_path_len is > 0, the relative path parsed from request. e.g.
+    // in http://example.com/path/file.html it would be /path/file.html. in
+    // http://example.com it would be /. It's the <path> in `GET <path> HTTP
+    // x.y`.
+    char *request_path;
+    // number of chars in request_path.
+    size_t request_path_len;
+
+    // the HTTP response when we generate it.
+    char *response;
+    // number of chars in response.
+    size_t response_len;
+    // the number of chars from response that we've sent so far
+    size_t response_sent_len;
+
+} session_t;
+
+/**
+ * Use to construct all session_t's. Allocates and initializes.
+ */
+session_t *session_new()
+{
+    session_t *s = malloc(sizeof *s);
+    s->fd = -1;
+    s->request = NULL;
+    s->request_len = 0;
+    s->request_path = NULL;
+    s->request_path_len = 0;
+    s->response = NULL;
+    s->response_len = 0;
+    s->response_sent_len = 0;
+
+    return s;
+}
+
+/**
+ * Deallocates all memory for session.
+ */
+void session_delete(session_t *session)
+{
+    free(session->request);
+    free(session->request_path);
+    free(session->response);
+    free(session);
+}
 
 /**
  * If return_value is -1, prints "<prefix>: <string description of errno>" then
@@ -201,6 +296,155 @@ void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len)
     freeaddrinfo(results);
 }
 
+/**
+ * Shared functionality in the epoll loop for closing a client session we no
+ * longer need.
+ */
+void close_session(int fd, struct epoll_event *epoll_events, int i,
+                   int epoll_fd)
+{
+    printf("closing session fd %d\n", fd);
+    session_delete((session_t *)epoll_events[i].data.ptr);
+    int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    check_error(ectl_rv, "close_session epoll_ctl");
+    close(fd);
+}
+
+/**
+ * Tries to extract the requested relative path from session->request, into
+ * session->request_path. Success can be determined by checking if
+ * session->request_path_len is > 0, or checking the return code. Return codes
+ * return TPRP_* values, and should be checked. Some indicate that it's bad data
+ * and the session should be closed.
+ */
+tprp_rv try_parse_request_path(session_t *session)
+{
+    // the buffer we're trying to parse needs to at least be as long as the
+    // prefix we're checking for
+    if (session->request_len < strlen(http_get_prefix))
+        return TPRP_NEEDMOREDATA;
+
+    // the first line (the only line we're parsing) needs to be a reasonable
+    // length
+    if (session->request_len > MAX_REQUEST_LINE_LENGTH)
+        return TPRP_TOOLONG;
+
+    // it needs to start with `GET `
+    if (memcmp(session->request, http_get_prefix, http_get_prefix_len) != 0)
+        return TPRP_NOPREFIX;
+
+    // there needs to be another space after the path
+    void *trailing_space = memchr(session->request + http_get_prefix_len, ' ',
+                                  session->request_len - http_get_prefix_len);
+    if (trailing_space == NULL)
+        return TPRP_NEEDMOREDATA;
+
+    // everything is satisfied, pull out the path.
+
+    // path length is the distance between the trailing space's pointer and the
+    // start of the line's pointer, minus the prefix length
+    session->request_path_len =
+        trailing_space - (void *)session->request - http_get_prefix_len;
+    session->request_path = malloc(session->request_path_len);
+    check_error_null(session->request_path, "malloc session->request_path");
+    memcpy(session->request_path, session->request + http_get_prefix_len,
+           session->request_path_len);
+    return TPRP_PARSED;
+}
+
+/**
+ * Based on session->request_path, generates the HTML response to send back, and
+ * stores it in session->response.
+ */
+void generate_response(session_t *session)
+{
+    if (session->request_len == 0)
+    {
+        printf("generate_response(): request_len is 0\n");
+        return;
+    }
+
+    // just send a test for now
+    char *test_response = "HTTP/1.0 200 OK\n"
+                          "Server: unsafehttp\n"
+                          "Connection: close\n"
+                          "Content-Type: text/html\n"
+                          "Content-Length: 16403\n"
+                          "\n"
+                          "<html>test</html>\n";
+    // test multiple writes by sending more than the default tcp write buffer
+    // size.
+    // not counting null terminators, we'll skip them
+    int test_response_total_len = strlen(test_response) + 10000000 + 1;
+    char *test_response_total = malloc(test_response_total_len);
+    memcpy(test_response_total, test_response, strlen(test_response));
+    memset(test_response_total + strlen(test_response), 'a', 10000000);
+    char *last_char = test_response_total + test_response_total_len - 1;
+    *last_char = 'b';
+
+    session->response_len = test_response_total_len;
+    session->response = test_response_total;
+
+    printf("total length: %d\n", test_response_total_len);
+}
+
+/**
+ * Tries to send the entire session->response to the non-blocking socket fd.
+ * Tracks the amount sent in session->response_sent_len. If a fatal error is
+ * received, will close the session. If a write would block, modifies the epoll
+ * entry to notify when writes are possible again - in this case (EPOLLOUT is
+ * received), call this function again and it will continue sending from where
+ * it left off.
+ */
+void send_response(int fd, session_t *session, struct epoll_event *epoll_events,
+                   int i, int epoll_fd)
+{
+    // start with a standard send-all-bytes loop
+    while (session->response_sent_len < session->response_len)
+    {
+        // try to send all the remaining bytes. start from where we're up to if
+        // we'd already sent some previously
+        int num_bytes_sent =
+            write(fd, session->response + session->response_sent_len,
+                  session->response_len - session->response_sent_len);
+
+        // failed to send this time, but might not be fatal
+        if (num_bytes_sent == -1)
+        {
+            // we're using non-blocking sockets, so check if it's a potential
+            // block
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                printf("got EAGAIN or EWOULDBLOCK\n");
+                // if it is, then ask epoll to tell us when we can write again
+                epoll_events[i].events |= EPOLLOUT;
+                int ectl_rv =
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &epoll_events[i]);
+                check_error(ectl_rv, "close_session epoll_ctl");
+            }
+            else
+            {
+                // otherwise log and close
+                print_if_error(num_bytes_sent, "send_response");
+                close_session(fd, epoll_events, i, epoll_fd);
+            }
+
+            break;
+        }
+        else
+        {
+            // we sent some data. track it, then let the loop try again if
+            // required
+            session->response_sent_len += num_bytes_sent;
+            printf("sent %d bytes\n", num_bytes_sent);
+        }
+    }
+
+    // if we've sent everything, we're done with this session
+    if (session->response_sent_len == session->response_len)
+        close_session(fd, epoll_events, i, epoll_fd);
+}
+
 int main(int argc, char const *argv[])
 {
     // listen on all IPs
@@ -223,8 +467,13 @@ int main(int argc, char const *argv[])
 
         struct epoll_event ee;
         ee.events = EPOLLIN;
-        ee.data.fd = listen_fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ee);
+        // the sessions that get monitored later use this struct, re-use it for
+        // the listen sockets here
+        session_t *session = session_new();
+        session->fd = listen_fd;
+        ee.data.ptr = session;
+        int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ee);
+        check_error(ectl_rv, "close_session epoll_ctl");
     }
 
     struct epoll_event epoll_events[EPOLL_MAX_EVENTS];
@@ -236,7 +485,7 @@ int main(int argc, char const *argv[])
         check_error(num_events, "epoll_wait");
         for (int i = 0; i < num_events; i++)
         {
-            int fd = epoll_events[i].data.fd;
+            int fd = ((session_t *)(epoll_events[i].data.ptr))->fd;
             // check whether epoll is telling is about an event on a listen
             // socket (a new connection), or an event on a client connection
             // socket (usually receiving data). If we had a potential lot of
@@ -275,9 +524,13 @@ int main(int argc, char const *argv[])
                 struct epoll_event ee;
                 // don't ask about EPOLLOUT (ability to write) until we need it,
                 // otherwise it will continue to trigger
-                ee.events = EPOLLIN;
-                ee.data.fd = connection_fd;
-                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection_fd, &ee);
+                ee.events = EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR;
+                session_t *session = session_new();
+                session->fd = connection_fd;
+                ee.data.ptr = session;
+                int ectl_rv =
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection_fd, &ee);
+                check_error(ectl_rv, "close_session epoll_ctl");
 
                 printf("got new connection fd %d via listen fd %d\n",
                        connection_fd, fd);
@@ -290,38 +543,94 @@ int main(int argc, char const *argv[])
                 if (epoll_events[i].events & EPOLLIN)
                 {
                     // read it in
-                    int num_bytes_read =
+                    int num_bytes_recvd =
                         recv(fd, client_buffer, CLIENT_BUFFER_LEN, 0);
 
-                    // can be a -1 plus error code too
-                    if (num_bytes_read == -1)
+                    // can be a -1 plus error code too.
+                    if (num_bytes_recvd == -1)
                     {
-                        print_if_error(num_bytes_read, "recv");
+                        // not specifically handling EAGAIN/EWOULDBLOCK, because
+                        // if epoll has notified us we have data to read, it
+                        // should never block (?)
+                        print_if_error(num_bytes_recvd, "recv");
                         continue;
                     }
 
                     // clean up the connection if it was closed on the remote
                     // side
-                    int socket_closed = num_bytes_read == 0;
+                    int socket_closed = num_bytes_recvd == 0;
                     if (socket_closed)
                     {
-                        close(fd);
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                        close_session(fd, epoll_events, i, epoll_fd);
                         continue;
                     }
 
+                    // valid data. Add it to what we've received so far
+                    session_t *session = epoll_events[i].data.ptr;
+                    int request_orig_len = session->request_len;
+                    session->request_len += num_bytes_recvd;
+                    session->request =
+                        realloc(session->request, session->request_len);
+                    check_error_null(session->request,
+                                     "realloc session->request");
+                    memcpy(session->request + request_orig_len, client_buffer,
+                           num_bytes_recvd);
+
+                    // try to extract the request path
+                    tprp_rv parse_result = try_parse_request_path(session);
+                    if (parse_result == TPRP_NEEDMOREDATA)
+                    {
+                        printf("need more data. So far: %.*s\n",
+                               (int)(session->request_len), session->request);
+                        // need more data. Wait for next packet
+                    }
+                    else if (parse_result == TPRP_NOPREFIX ||
+                             parse_result == TPRP_TOOLONG)
+                    {
+                        // bad request, close.
+                        close_session(fd, epoll_events, i, epoll_fd);
+                    }
+                    else if (parse_result == TPRP_PARSED)
+                    {
+                        // we have the path. Try to send back the requested
+                        // content
+                        generate_response(session);
+                        send_response(fd, session, epoll_events, i, epoll_fd);
+                    }
+                    else
+                    {
+                        printf("unhandled TPRP_ parse result: %d\n",
+                               parse_result);
+                    }
+
                     // show contents for debugging
-                    print_buffer(client_buffer, num_bytes_read);
-                    // send back some data. Just testing atm - no
-                    // EAGAIN/EWOULDBLOCK buffering yet
-                    int num_bytes_sent = send(fd, &"hello\n", 6, 0);
-                    printf("sent %d bytes\n", num_bytes_sent);
+                    // print_buffer(client_buffer, num_bytes_read);
+                }
+                // we previously tried to send data and couldn't send all of it.
+                // we can now send more
+                else if (epoll_events[i].events & (EPOLLOUT))
+                {
+                    session_t *session = epoll_events[i].data.ptr;
+                    send_response(fd, session, epoll_events, i, epoll_fd);
+                }
+                // a hangup or error
+                else
+                {
+                    printf("hangup or error on fd %d: %d", fd,
+                           epoll_events[i].events);
+                    // clean up
+                    close_session(fd, epoll_events, i, epoll_fd);
                 }
             }
         }
     }
 
-    free(listen_fds);
-    free(client_buffer);
+    // not freeing listen_fds, client_buffer, or the session_t's of currently
+    // open listen or session sockets, for simplicity - the OS will reclaim when
+    // we exit. session_t's we're finished with during program execution are
+    // still cleaned up. This avoids having to maintain our own list of
+    // session_t pointers because I can't see a way to iterate over all
+    // remaining fds in an epoll instance's interest list.
+
     return 0;
 }
