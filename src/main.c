@@ -54,20 +54,36 @@ char *http_get_prefix = "GET ";
 int http_get_prefix_len = 4;
 
 /**
+ * We pass a few different structs to epoll to return to us, as a union. This
+ * differentiates between them.
+ */
+typedef enum
+{
+    // listen socket
+    EPT_LISTEN,
+    // per-connection socket
+    EPT_CONNECTION,
+    //timerfd
+    EPT_TIMEOUT,
+} event_ptr_type;
+
+// forward declaration so session_t can use it.
+typedef struct timeout_t timeout_t;
+
+/**
  * A HTTP request/response section. A pointer to one of these is passed to each
  * connection entry stored in our epoll instance. Allows us to buffer data
  * across multiple epoll loops as we wait for it all to come in or go out.
  *
- * We also re-use this for listen sockets monitored via epoll, as they only need
- * the fd. If they had differing fields we could create another struct that
- * started with an `int fd` member, then union them.
- *
- * Construct with session_new().
+ * use session_new() / session_delete().
  *
  * Strings are not NUL-terminated, use the related length var.
  */
 typedef struct
 {
+    // which of the union structs this struct is
+    event_ptr_type type;
+
     // the socket fd this session is associated with. epoll's fd and data
     // storage is a union, so we have to re-include it now that we're asking
     // epoll to track custom data for us.
@@ -92,22 +108,81 @@ typedef struct
     // the number of chars from response that we've sent so far
     size_t response_sent_len;
 
+    // the timer that has been set to close this session if there isn't more
+    // request data within a short enough time.
+    timeout_t *timeout;
+
 } session_t;
 
 /**
- * Use to construct all session_t's. Allocates and initializes.
+ * Event data passed to epoll for listen sockets.
+ * 
+ * use listen_sock_new() / listen_sock_delete().
+ * 
  */
-session_t *session_new()
+typedef struct
 {
-    session_t *s = malloc(sizeof *s);
-    s->fd = -1;
-    s->request = NULL;
-    s->request_len = 0;
-    s->request_path = NULL;
-    s->request_path_len = 0;
-    s->response = NULL;
-    s->response_len = 0;
-    s->response_sent_len = 0;
+    // which of the union structs this struct is
+    event_ptr_type type;
+
+    // the socket fd this listen_sock is associated with. epoll's fd and data
+    // storage is a union, so we have to re-include it now that we're asking
+    // epoll to track custom data for us.
+    int fd;
+
+} listen_sock_t;
+
+/**
+ * Event data passed to epoll for timers that we use to close sessions that
+ * haven't been active in a while, to prevent them hanging around too long.
+ * 
+ * use timeout_new() / timeout_delete().
+ * 
+ * (named because we need to forward-declare above).
+ */
+typedef struct timeout_t
+{
+    // which of the union structs this struct is
+    event_ptr_type type;
+
+    // the socket fd this timer is associated with. epoll's fd and data
+    // storage is a union, so we have to re-include it now that we're asking
+    // epoll to track custom data for us.
+    int fd;
+
+    // the session that we should close if our timer is triggered.
+    session_t *session;
+
+} timeout_t;
+
+/**
+ * We have epoll monitor 3 distinct things, and track a pointer to some data for
+ * them.
+ */
+typedef union
+{
+    listen_sock_t listen_sock;
+    session_t session;
+    timeout_t timeout;
+} uh_epoll_data;
+
+/**
+ * Use to construct all session_t's. Allocates and
+ * initializes.
+ */
+uh_epoll_data *session_new()
+{
+    uh_epoll_data *s = malloc(sizeof *s);
+    s->session.type = EPT_CONNECTION;
+    s->session.fd = -1;
+    s->session.request = NULL;
+    s->session.request_len = 0;
+    s->session.request_path = NULL;
+    s->session.request_path_len = 0;
+    s->session.response = NULL;
+    s->session.response_len = 0;
+    s->session.response_sent_len = 0;
+    s->session.timeout = NULL;
 
     return s;
 }
@@ -115,12 +190,53 @@ session_t *session_new()
 /**
  * Deallocates all memory for session.
  */
-void session_delete(session_t *session)
+void session_delete(uh_epoll_data *ed)
 {
-    free(session->request);
-    free(session->request_path);
-    free(session->response);
-    free(session);
+    free(ed->session.request);
+    free(ed->session.request_path);
+    free(ed->session.response);
+    free(ed);
+}
+
+/**
+ * Use to construct all listen_sock_t's. Allocates and initializes.
+ */
+uh_epoll_data *listen_sock_new()
+{
+    uh_epoll_data *l = malloc(sizeof *l);
+    l->listen_sock.type = EPT_LISTEN;
+    l->listen_sock.fd = -1;
+  
+    return l;
+}
+
+/**
+ * Deallocates all memory for listen_sock.
+ */
+void listen_sock_delete(uh_epoll_data *ed)
+{
+    free(ed);
+}
+
+/**
+ * Use to construct all timeout_t's. Allocates and initializes.
+ */
+uh_epoll_data *timeout_new()
+{
+    uh_epoll_data *t = malloc(sizeof *t);
+    t->timeout.type = EPT_TIMEOUT;
+    t->timeout.fd = -1;
+    t->timeout.session = NULL;
+  
+    return t;
+}
+
+/**
+ * Deallocates all memory for timeout.
+ */
+void timeout_delete(uh_epoll_data *ed)
+{
+    free(ed);
 }
 
 /**
@@ -304,7 +420,8 @@ void close_session(int fd, struct epoll_event *epoll_events, int i,
                    int epoll_fd)
 {
     printf("closing session fd %d\n", fd);
-    session_delete((session_t *)epoll_events[i].data.ptr);
+    uh_epoll_data *ed = (uh_epoll_data *)epoll_events[i].data.ptr;
+    session_delete(ed);
     int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     check_error(ectl_rv, "close_session epoll_ctl");
     close(fd);
@@ -467,11 +584,9 @@ int main(int argc, char const *argv[])
 
         struct epoll_event ee;
         ee.events = EPOLLIN;
-        // the sessions that get monitored later use this struct, re-use it for
-        // the listen sockets here
-        session_t *session = session_new();
-        session->fd = listen_fd;
-        ee.data.ptr = session;
+        uh_epoll_data *ed = listen_sock_new();
+        ed->listen_sock.fd = listen_fd;
+        ee.data.ptr = ed;
         int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ee);
         check_error(ectl_rv, "close_session epoll_ctl");
     }
@@ -485,28 +600,12 @@ int main(int argc, char const *argv[])
         check_error(num_events, "epoll_wait");
         for (int i = 0; i < num_events; i++)
         {
-            int fd = ((session_t *)(epoll_events[i].data.ptr))->fd;
-            // check whether epoll is telling is about an event on a listen
-            // socket (a new connection), or an event on a client connection
-            // socket (usually receiving data). If we had a potential lot of
-            // listen_fds to check against, this would be very inefficient, and
-            // a more efficient way to do it would be to pass a pointer to a
-            // custom struct to epoll instead of just fd (in the epoll_data
-            // union), but then we'd have to maintain a separate set of structs,
-            // one for each fd that epoll is listening for events on. Luckily,
-            // we will only usually have one listen fd (because of the automatic
-            // dual-stack), so we can just take the simple path.
-            int is_listen_fd = 0;
-            for (int j = 0; j < listen_fds_len; j++)
-            {
-                if (listen_fds[j] == fd)
-                {
-                    is_listen_fd = 1;
-                    break;
-                }
-            }
+            // all members of the union have the same initial members so this is
+            // valid for all
+            int fd = ((uh_epoll_data *)(epoll_events[i].data.ptr))->session.fd;
+            int fd_type = ((uh_epoll_data *)(epoll_events[i].data.ptr))->session.type;
 
-            if (is_listen_fd)
+            if (fd_type == EPT_LISTEN)
             {
                 // we're the listening socket, and have a new connection. Accept
                 // it
@@ -525,9 +624,9 @@ int main(int argc, char const *argv[])
                 // don't ask about EPOLLOUT (ability to write) until we need it,
                 // otherwise it will continue to trigger
                 ee.events = EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR;
-                session_t *session = session_new();
-                session->fd = connection_fd;
-                ee.data.ptr = session;
+                uh_epoll_data *ed = session_new();
+                ed->session.fd = connection_fd;
+                ee.data.ptr = ed;
                 int ectl_rv =
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection_fd, &ee);
                 check_error(ectl_rv, "close_session epoll_ctl");
@@ -566,22 +665,22 @@ int main(int argc, char const *argv[])
                     }
 
                     // valid data. Add it to what we've received so far
-                    session_t *session = epoll_events[i].data.ptr;
-                    int request_orig_len = session->request_len;
-                    session->request_len += num_bytes_recvd;
-                    session->request =
-                        realloc(session->request, session->request_len);
-                    check_error_null(session->request,
+                    uh_epoll_data *ed = epoll_events[i].data.ptr;
+                    int request_orig_len = ed->session.request_len;
+                    ed->session.request_len += num_bytes_recvd;
+                    ed->session.request =
+                        realloc(ed->session.request, ed->session.request_len);
+                    check_error_null(ed->session.request,
                                      "realloc session->request");
-                    memcpy(session->request + request_orig_len, client_buffer,
+                    memcpy(ed->session.request + request_orig_len, client_buffer,
                            num_bytes_recvd);
 
                     // try to extract the request path
-                    tprp_rv parse_result = try_parse_request_path(session);
+                    tprp_rv parse_result = try_parse_request_path(&(ed->session));
                     if (parse_result == TPRP_NEEDMOREDATA)
                     {
                         printf("need more data. So far: %.*s\n",
-                               (int)(session->request_len), session->request);
+                               (int)(ed->session.request_len), ed->session.request);
                         // need more data. Wait for next packet
                     }
                     else if (parse_result == TPRP_NOPREFIX ||
@@ -594,8 +693,8 @@ int main(int argc, char const *argv[])
                     {
                         // we have the path. Try to send back the requested
                         // content
-                        generate_response(session);
-                        send_response(fd, session, epoll_events, i, epoll_fd);
+                        generate_response(&(ed->session));
+                        send_response(fd, &(ed->session), epoll_events, i, epoll_fd);
                     }
                     else
                     {
@@ -610,8 +709,8 @@ int main(int argc, char const *argv[])
                 // we can now send more
                 else if (epoll_events[i].events & (EPOLLOUT))
                 {
-                    session_t *session = epoll_events[i].data.ptr;
-                    send_response(fd, session, epoll_events, i, epoll_fd);
+                    uh_epoll_data *ed = epoll_events[i].data.ptr;
+                    send_response(fd, &(ed->session), epoll_events, i, epoll_fd);
                 }
                 // a hangup or error
                 else
