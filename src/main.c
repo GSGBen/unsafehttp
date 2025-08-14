@@ -3,6 +3,7 @@
  * Beej's network programming guide. https://beej.us/guide/bgnet/html/.
  */
 
+#include "ht.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -105,7 +106,7 @@ typedef struct
     size_t request_path_len;
 
     // the HTTP response when we generate it.
-    char *response;
+    uint8_t *response;
     // number of chars in response.
     size_t response_len;
     // the number of chars from response that we've sent so far
@@ -168,6 +169,15 @@ typedef union
     session_t session;
     timeout_t timeout;
 } uh_epoll_data;
+
+/**
+ * A http response resource (.html, .jpg, .css file etc) we load from disk.
+ */
+typedef struct
+{
+    uint8_t *content;
+    size_t content_len;
+} content_t;
 
 /**
  * Use to construct all session_t's. Allocates and
@@ -419,7 +429,7 @@ void close_session(session_t *session, int epoll_fd)
     int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, session->fd, NULL);
     check_error(ectl_rv, "close_session epoll_ctl");
     close(session->fd);
-    timeout_t* timeout = session->timeout;
+    timeout_t *timeout = session->timeout;
     session_delete(session);
 
     ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, timeout->fd, NULL);
@@ -474,7 +484,7 @@ tprp_rv try_parse_request_path(session_t *session)
  * Based on session->request_path, generates the HTML response to send back, and
  * stores it in session->response.
  */
-void generate_response(session_t *session)
+void generate_response(session_t *session, ht *content_ht)
 {
     if (session->request_len == 0)
     {
@@ -482,28 +492,44 @@ void generate_response(session_t *session)
         return;
     }
 
-    // just send a test for now
-    char *test_response = "HTTP/1.0 200 OK\n"
-                          "Server: unsafehttp\n"
-                          "Connection: close\n"
-                          "Content-Type: text/html\n"
-                          "Content-Length: 16403\n"
-                          "\n"
-                          "<html>test</html>\n";
-    // test multiple writes by sending more than the default tcp write buffer
-    // size.
-    // not counting null terminators, we'll skip them
-    int test_response_total_len = strlen(test_response) + 10000000 + 1;
-    char *test_response_total = malloc(test_response_total_len);
-    memcpy(test_response_total, test_response, strlen(test_response));
-    memset(test_response_total + strlen(test_response), 'a', 10000000);
-    char *last_char = test_response_total + test_response_total_len - 1;
-    *last_char = 'b';
+    // our strings are all length-delimited, but ht uses null-terminated
+    // strings. The paths we get in are user-controlled. I don't want to rewrite
+    // ht to support length-delimited strings, so we'll just add a null
+    // terminator here to guarantee the string we get from the user always has
+    // one (load_content() which we control ensures our keys have them too). In
+    // the correct case, our non-null-terminated path will get a single null
+    // terminator at the end. In a malicious case, if a user inserts a null
+    // terminator in the path, it just won't match a key and no content will be
+    // returned. ht_get() and its underlying functions don't do anything strange
+    // to the key.
+    char *null_term_path = malloc(session->request_path_len + 1);
+    strncpy(null_term_path, session->request_path, session->request_path_len);
+    null_term_path[session->request_path_len] = '\0';
 
-    session->response_len = test_response_total_len;
-    session->response = test_response_total;
+    content_t *response = ht_get(content_ht, null_term_path);
+    free(null_term_path);
 
-    printf("total length: %d\n", test_response_total_len);
+    if (response == NULL)
+    {
+        // content not found, return a 404
+        static char *fof = "HTTP/1.0 404 Not Found\r\n"
+                           "Server: unsafehttp\r\n"
+                           "Connection: close\r\n"
+                           "Content-Type: text/html\r\n"
+                           "Content-Length: 28\r\n"
+                           "\r\n"
+                           "<html>404 Not Found</html>\r\n";
+        session->response = malloc(strlen(fof));
+        memcpy(session->response, fof, strlen(fof));
+        session->response_len = strlen(fof);
+    }
+    else
+    {
+        // found some content to return
+        session->response = malloc(response->content_len);
+        memcpy(session->response, response->content, response->content_len);
+        session->response_len = response->content_len;
+    }
 }
 
 /**
@@ -563,8 +589,38 @@ void send_response(int fd, session_t *session, struct epoll_event *epoll_events,
         close_session(session, epoll_fd);
 }
 
+/**
+ * Loads content of all files under content_dir as values int content_ht, keyed
+ * by their relative path (from the root of content_dir). Keys will be
+ * null-terminated as required by content_ht, but values (the contents of the
+ * files) won't be. Values are content_t structs.
+ */
+void load_content(ht *content_ht)
+{
+    // TODO: load from disk. for now just generate test content.
+    // REMEMBER TO MAKE SURE THE KEYS ARE NULL TERMINATED
+    static char *key_base = "/";
+    static char *value_base_string = "HTTP/1.0 200 OK\r\n"
+                                     "Server: unsafehttp\r\n"
+                                     "Connection: close\r\n"
+                                     "Content-Type: text/html\r\n"
+                                     "Content-Length: 25\r\n"
+                                     "\r\n"
+                                     "<html>Index page</html>\r\n";
+    static content_t value_base;
+    value_base.content = (uint8_t *)value_base_string;
+    value_base.content_len = strlen(value_base_string);
+    ht_set(content_ht, key_base, &value_base);
+}
+
 int main(int argc, char const *argv[])
 {
+    // to prevent user-initiated filesystem interaction, and to avoid having to
+    // worry about path cleaning, load all content into memory on startup, and
+    // access via hash table keyed on HTTP request path.
+    ht *content_ht = ht_create();
+    load_content(content_ht);
+
     // listen on all IPs
     int *listen_fds = NULL;
     int listen_fds_len = 0;
@@ -735,7 +791,7 @@ int main(int argc, char const *argv[])
                     {
                         // we have the path. Try to send back the requested
                         // content
-                        generate_response(&(ed->session));
+                        generate_response(&(ed->session), content_ht);
                         send_response(fd, &(ed->session), epoll_events, i,
                                       epoll_fd);
                     }
