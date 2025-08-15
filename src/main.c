@@ -494,6 +494,21 @@ tprp_rv try_parse_request_path(session_t *session)
 }
 
 /**
+ * Any server-side path changes go here. E.g. / -> index.html.
+ */
+void rewrite_path(session_t *session)
+{
+    if (session->request_path_len == 1 && session->request_path[0] == '/')
+    {
+        static const char* index_path = "/index.html";
+        session->request_path_len = 11;
+        session->request_path = realloc(session->request_path, session->request_path_len);
+        check_error_null(session->request_path, "rewrite_path realloc");
+        memcpy(session->request_path, index_path, session->request_path_len);
+    }
+}
+
+/**
  * Based on session->request_path, generates the HTML response to send back, and
  * stores it in session->response.
  */
@@ -567,9 +582,10 @@ void generate_response(session_t *session)
         void *memcpy_rv = memcpy(session->response, prefix, strlen(prefix));
         check_error_null(memcpy_rv, "generate_response 200 memcpy 1");
 
-        // +1 because snprintf will truncate to fit the null terminator. We'll overwrite it
-        snprintf((char *)session->response + strlen(prefix), content_len_str_len + 1, "%zu",
-                 content->content_len);
+        // +1 because snprintf will truncate to fit the null terminator. We'll
+        // overwrite it
+        snprintf((char *)session->response + strlen(prefix),
+                 content_len_str_len + 1, "%zu", content->content_len);
 
         memcpy_rv =
             memcpy(session->response + strlen(prefix) + content_len_str_len,
@@ -880,6 +896,7 @@ int main(int argc, char const *argv[])
                     {
                         // we have the path. Try to send back the requested
                         // content
+                        rewrite_path(&(ed->session));
                         generate_response(&(ed->session));
                         send_response(fd, &(ed->session), epoll_events, i,
                                       epoll_fd);
