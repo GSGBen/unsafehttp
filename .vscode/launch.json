@@ -28,7 +28,12 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/unsafehttp",
-            "args": [],
+            "args": [
+                "--port",
+                "8080",
+                "--content-path",
+                "content/"
+            ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

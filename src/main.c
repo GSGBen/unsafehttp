@@ -18,10 +18,8 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <getopt.h>
 
-// TODO: take in as args
-#define PORT "8080"
-#define CONTENT_PATH "content"
 // max number of incoming connections the kernel will buffer
 #define BACKLOG 10
 // the max number of events epoll will notify us about each time. Not sure how
@@ -48,7 +46,7 @@
 // with ntfw(), and its callback function doesn't have any user parameters.
 ht *content_ht;
 // same, needs to be global for the callback
-char *content_dir_path = CONTENT_PATH;
+char *content_dir_path;
 
 typedef enum
 {
@@ -361,7 +359,7 @@ void print_buffer(void *buffer, int len)
 // wildcard IPs - so all), but currently only returns one: it turns out that if
 // you request to listen on the IPv6 wildcard address with the default settings,
 // it's dual-stack anyway.
-void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len)
+void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len, const char *port)
 {
     // detail our desired bind type, and get results back about what we can
     // potentially bind to
@@ -380,7 +378,7 @@ void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len)
     // and it can't do that to a local array/list (the same reason for the
     // double pointer argument to to our function).
     struct addrinfo *results;
-    getaddrinfo(NULL, PORT, &hints, &results);
+    getaddrinfo(NULL, port, &hints, &results);
 
     int yes = 1;
     char ipstr[INET6_ADDRSTRLEN];
@@ -719,7 +717,7 @@ int load_content_file(const char *fpath, const struct stat *sb, int typeflag,
     // want to include the / at the start of the relative path as that's how the
     // HTTP requests will come in.
     int has_trailing_slash =
-        content_dir_path[strlen(content_dir_path - 1)] == '/';
+        content_dir_path[strlen(content_dir_path) - 1] == '/';
     const char *key =
         fpath + strlen(content_dir_path) + (has_trailing_slash ? -1 : 0);
 
@@ -746,8 +744,57 @@ void load_content()
     check_error(ntfwt_rv, "nftw");
 }
 
-int main(int argc, char const *argv[])
+int main(int argc, char *argv[])
 {
+    // parse required args. reference mostly
+    // https://www.gnu.org/software/libc/manual/html_node/Getopt-Long-Option-Example.html
+    // and the previous page it links to. Better descriptions than the man page
+    // in this case.
+    char *port;
+    static struct option long_options[] = {
+        {"port", required_argument, NULL, 'p'},
+        {"content-path", required_argument, NULL, 'c'},
+        {0,0,0,0}
+    };
+    while (1)
+    {
+        int option_index = 0;
+        int c = getopt_long(argc, argv, "", long_options, &option_index);
+        if (c == -1)
+        {
+            // end of options
+            break;
+        }
+        else if (c == 'p')
+        {
+            // port
+            
+            // the actual argument is stored in a gloal defined elsewhere
+            printf("%s\n", optarg);
+            // +1 for nul-terminator
+            port = malloc(strlen(optarg) + 1);
+            check_error_null(port, "malloc content_dir_path");
+            strcpy(port, optarg);
+        }
+        else if (c == 'c')
+        {
+            // content dir
+            content_dir_path = malloc(strlen(optarg) + 1);
+            check_error_null(content_dir_path, "malloc content_dir_path");
+            strcpy(content_dir_path, optarg);
+        }
+    }
+    if (content_dir_path == NULL)
+    {
+        printf("`--content-path <path>` is a required argument\n");
+        exit(1);
+    }
+    if (port == NULL)
+    {
+        printf("`--port <port to listen on>` is a required argument\n");
+        exit(1);
+    }
+
     // to prevent user-initiated filesystem interaction, and to avoid having to
     // worry about path cleaning, load all content into memory on startup, and
     // access via hash table keyed on HTTP request path.
@@ -756,7 +803,7 @@ int main(int argc, char const *argv[])
     // listen on all IPs
     int *listen_fds = NULL;
     int listen_fds_len = 0;
-    create_listen_sockets(&listen_fds, &listen_fds_len);
+    create_listen_sockets(&listen_fds, &listen_fds_len, port);
 
     // set up epoll to efficiently monitor our listen and individual client
     // connection sockets

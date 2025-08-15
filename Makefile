@@ -12,6 +12,9 @@ CFLAGS_DEV := -g -fsanitize=address -fsanitize=leak -fsanitize=undefined
 
 SRC_FILES := $(shell find $(SRC_DIRS) -name '*.c')
 
+# default args
+ARGS := --port 8080 --content-path content/
+
 default: build-dev
 
 .PHONY: build-dev
