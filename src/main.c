@@ -2,11 +2,13 @@
  * The base network/socket programming and poll structure stuff is based on
  * Beej's network programming guide. https://beej.us/guide/bgnet/html/.
  */
+#define _GNU_SOURCE
 
 #include "ht.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,8 +19,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-// TODO: take in as arg
+// TODO: take in as args
 #define PORT "8080"
+#define CONTENT_PATH "content"
 // max number of incoming connections the kernel will buffer
 #define BACKLOG 10
 // the max number of events epoll will notify us about each time. Not sure how
@@ -38,6 +41,15 @@
 #define SESSION_TIMEOUT_SEC 5
 // return codes for try_parse_request_path().
 
+// to prevent user-initiated filesystem interaction, and to avoid having to
+// worry about path cleaning, load all content into memory on startup, and
+// access via hash table keyed on HTTP request path.
+// unfortunately it needs to be a global var because we walk the content dir
+// with ntfw(), and its callback function doesn't have any user parameters.
+ht *content_ht;
+// same, needs to be global for the callback
+char *content_dir_path = CONTENT_PATH;
+
 typedef enum
 {
     // not enough data to determine the requested path yet
@@ -51,11 +63,6 @@ typedef enum
     // we've successfully parsed the path.
     TPRP_PARSED,
 } tprp_rv;
-/**
- * The first part of the request, that precedes the path.
- */
-char *http_get_prefix = "GET ";
-int http_get_prefix_len = 4;
 
 /**
  * We pass a few different structs to epoll to return to us, as a union. This
@@ -180,73 +187,6 @@ typedef struct
 } content_t;
 
 /**
- * Use to construct all session_t's. Allocates and
- * initializes.
- */
-uh_epoll_data *session_new()
-{
-    uh_epoll_data *s = malloc(sizeof *s);
-    s->session.type = EPT_CONNECTION;
-    s->session.fd = -1;
-    s->session.request = NULL;
-    s->session.request_len = 0;
-    s->session.request_path = NULL;
-    s->session.request_path_len = 0;
-    s->session.response = NULL;
-    s->session.response_len = 0;
-    s->session.response_sent_len = 0;
-    s->session.timeout = NULL;
-
-    return s;
-}
-
-/**
- * Deallocates all memory for session. Doesn't deallocate timeout.
- */
-void session_delete(session_t *session)
-{
-    free(session->request);
-    free(session->request_path);
-    free(session->response);
-    free(session);
-}
-
-/**
- * Use to construct all listen_sock_t's. Allocates and initializes.
- */
-uh_epoll_data *listen_sock_new()
-{
-    uh_epoll_data *l = malloc(sizeof *l);
-    l->listen_sock.type = EPT_LISTEN;
-    l->listen_sock.fd = -1;
-
-    return l;
-}
-
-/**
- * Deallocates all memory for listen_sock.
- */
-void listen_sock_delete(listen_sock_t *listen_sock) { free(listen_sock); }
-
-/**
- * Use to construct all timeout_t's. Allocates and initializes.
- */
-uh_epoll_data *timeout_new()
-{
-    uh_epoll_data *t = malloc(sizeof *t);
-    t->timeout.type = EPT_TIMEOUT;
-    t->timeout.fd = -1;
-    t->timeout.session = NULL;
-
-    return t;
-}
-
-/**
- * Deallocates all memory for timeout. Doesn't deallocate session.
- */
-void timeout_delete(timeout_t *timeout) { free(timeout); }
-
-/**
  * If return_value is -1, prints "<prefix>: <string description of errno>" then
  * exits with a return code of 1.
  */
@@ -296,6 +236,76 @@ void print_if_error(int return_value, const char *prefix)
         printf("%s: %s\n", prefix, strerror(errno));
     }
 }
+
+/**
+ * Use to construct all session_t's. Allocates and
+ * initializes.
+ */
+uh_epoll_data *session_new()
+{
+    uh_epoll_data *s = malloc(sizeof *s);
+    check_error_null(s, "malloc session_new");
+    s->session.type = EPT_CONNECTION;
+    s->session.fd = -1;
+    s->session.request = NULL;
+    s->session.request_len = 0;
+    s->session.request_path = NULL;
+    s->session.request_path_len = 0;
+    s->session.response = NULL;
+    s->session.response_len = 0;
+    s->session.response_sent_len = 0;
+    s->session.timeout = NULL;
+
+    return s;
+}
+
+/**
+ * Deallocates all memory for session. Doesn't deallocate timeout.
+ */
+void session_delete(session_t *session)
+{
+    free(session->request);
+    free(session->request_path);
+    free(session->response);
+    free(session);
+}
+
+/**
+ * Use to construct all listen_sock_t's. Allocates and initializes.
+ */
+uh_epoll_data *listen_sock_new()
+{
+    uh_epoll_data *l = malloc(sizeof *l);
+    check_error_null(l, "malloc listen_sock_new");
+    l->listen_sock.type = EPT_LISTEN;
+    l->listen_sock.fd = -1;
+
+    return l;
+}
+
+/**
+ * Deallocates all memory for listen_sock.
+ */
+void listen_sock_delete(listen_sock_t *listen_sock) { free(listen_sock); }
+
+/**
+ * Use to construct all timeout_t's. Allocates and initializes.
+ */
+uh_epoll_data *timeout_new()
+{
+    uh_epoll_data *t = malloc(sizeof *t);
+    check_error_null(t, "malloc timeout_new");
+    t->timeout.type = EPT_TIMEOUT;
+    t->timeout.fd = -1;
+    t->timeout.session = NULL;
+
+    return t;
+}
+
+/**
+ * Deallocates all memory for timeout. Doesn't deallocate session.
+ */
+void timeout_delete(timeout_t *timeout) { free(timeout); }
 
 /**
  * Returns in out_str, the IP referenced by addrinfo. out_str should be `char
@@ -447,6 +457,9 @@ void close_session(session_t *session, int epoll_fd)
  */
 tprp_rv try_parse_request_path(session_t *session)
 {
+    static char *http_get_prefix = "GET ";
+    static int http_get_prefix_len = 4;
+
     // the buffer we're trying to parse needs to at least be as long as the
     // prefix we're checking for
     if (session->request_len < strlen(http_get_prefix))
@@ -484,7 +497,7 @@ tprp_rv try_parse_request_path(session_t *session)
  * Based on session->request_path, generates the HTML response to send back, and
  * stores it in session->response.
  */
-void generate_response(session_t *session, ht *content_ht)
+void generate_response(session_t *session)
 {
     if (session->request_len == 0)
     {
@@ -492,7 +505,7 @@ void generate_response(session_t *session, ht *content_ht)
         return;
     }
 
-    // our strings are all length-delimited, but ht uses null-terminated
+    // our struct strings are all length-delimited, but ht uses null-terminated
     // strings. The paths we get in are user-controlled. I don't want to rewrite
     // ht to support length-delimited strings, so we'll just add a null
     // terminator here to guarantee the string we get from the user always has
@@ -503,13 +516,14 @@ void generate_response(session_t *session, ht *content_ht)
     // returned. ht_get() and its underlying functions don't do anything strange
     // to the key.
     char *null_term_path = malloc(session->request_path_len + 1);
+    check_error_null(null_term_path, "malloc null_term_path");
     strncpy(null_term_path, session->request_path, session->request_path_len);
     null_term_path[session->request_path_len] = '\0';
 
-    content_t *response = ht_get(content_ht, null_term_path);
+    content_t *content = ht_get(content_ht, null_term_path);
     free(null_term_path);
 
-    if (response == NULL)
+    if (content == NULL)
     {
         // content not found, return a 404
         static char *fof = "HTTP/1.0 404 Not Found\r\n"
@@ -520,15 +534,52 @@ void generate_response(session_t *session, ht *content_ht)
                            "\r\n"
                            "<html>404 Not Found</html>\r\n";
         session->response = malloc(strlen(fof));
+        check_error_null(session->response, "malloc session->response");
         memcpy(session->response, fof, strlen(fof));
         session->response_len = strlen(fof);
     }
     else
     {
-        // found some content to return
-        session->response = malloc(response->content_len);
-        memcpy(session->response, response->content, response->content_len);
-        session->response_len = response->content_len;
+        // found some content to return. construct a response and send it.
+
+        // prepare to convert content-length to str. calling snprintf like this
+        // gives you the required string length of the converted value
+        int content_len_str_len =
+            snprintf(NULL, 0, "%zu", content->content_len);
+
+        // prepare each part of the response, calculate size and allocate space,
+        // copy into the session data
+
+        static char *prefix = "HTTP/1.0 200 OK\r\n"
+                              "Server: unsafehttp\r\n"
+                              "Connection: close\r\n"
+                              "Content-Type: text/html\r\n"
+                              "Content-Length: ";
+        static char *middle = "\r\n"
+                              "\r\n";
+
+        session->response_len = strlen(prefix) + content_len_str_len +
+                                strlen(middle) + content->content_len;
+
+        session->response = malloc(session->response_len);
+        check_error_null(session->response, "malloc session->response");
+
+        void *memcpy_rv = memcpy(session->response, prefix, strlen(prefix));
+        check_error_null(memcpy_rv, "generate_response 200 memcpy 1");
+
+        // +1 because snprintf will truncate to fit the null terminator. We'll overwrite it
+        snprintf((char *)session->response + strlen(prefix), content_len_str_len + 1, "%zu",
+                 content->content_len);
+
+        memcpy_rv =
+            memcpy(session->response + strlen(prefix) + content_len_str_len,
+                   middle, strlen(middle));
+        check_error_null(memcpy_rv, "generate_response 200 memcpy 2");
+
+        memcpy_rv = memcpy(session->response + strlen(prefix) +
+                               content_len_str_len + strlen(middle),
+                           content->content, content->content_len);
+        check_error_null(memcpy_rv, "generate_response 200 memcpy 3");
     }
 }
 
@@ -590,27 +641,65 @@ void send_response(int fd, session_t *session, struct epoll_event *epoll_events,
 }
 
 /**
+ * Per-file callback function for load_content
+ */
+int load_content_file(const char *fpath, const struct stat *sb, int typeflag,
+                      struct FTW *ftwbuf)
+{
+    // ignore directories
+    if (typeflag != FTW_F)
+        return 0;
+
+    printf("lcf: %s, %d, %d\n", fpath, ftwbuf->base, ftwbuf->level);
+
+    // read the file into memory, and pre-prepare a HTTP response based on it.
+    // global/singleton data - not freeing. See end of main().
+
+    uint8_t *content_bytes = malloc(sb->st_size);
+    check_error_null(content_bytes, "load_content_file malloc");
+
+    FILE *f = fopen(fpath, "rb");
+    check_error_null(f, "fopen");
+    int num_read = fread(content_bytes, sb->st_size, 1, f);
+    check_error(num_read, "fread");
+    int fc_rv = fclose(f);
+    check_error(fc_rv, "fclose");
+
+    content_t *content = malloc(sizeof *content);
+    check_error_null(content, "content malloc");
+    content->content = content_bytes;
+    content->content_len = sb->st_size;
+
+    // convert the relative (from the content directory) path into a key. ht_set
+    // will handle the copy so we only need to point to the start of the key. we
+    // want to include the / at the start of the relative path as that's how the
+    // HTTP requests will come in.
+    int has_trailing_slash =
+        content_dir_path[strlen(content_dir_path - 1)] == '/';
+    const char *key =
+        fpath + strlen(content_dir_path) + (has_trailing_slash ? -1 : 0);
+
+    // store it
+    void *hts_rv = (void *)ht_set(content_ht, key, content);
+    check_error_null(hts_rv, "ht_set load_content_file");
+
+    return 0;
+}
+
+/**
  * Loads content of all files under content_dir as values int content_ht, keyed
  * by their relative path (from the root of content_dir). Keys will be
  * null-terminated as required by content_ht, but values (the contents of the
  * files) won't be. Values are content_t structs.
  */
-void load_content(ht *content_ht)
+void load_content()
 {
-    // TODO: load from disk. for now just generate test content.
-    // REMEMBER TO MAKE SURE THE KEYS ARE NULL TERMINATED
-    static char *key_base = "/";
-    static char *value_base_string = "HTTP/1.0 200 OK\r\n"
-                                     "Server: unsafehttp\r\n"
-                                     "Connection: close\r\n"
-                                     "Content-Type: text/html\r\n"
-                                     "Content-Length: 25\r\n"
-                                     "\r\n"
-                                     "<html>Index page</html>\r\n";
-    static content_t value_base;
-    value_base.content = (uint8_t *)value_base_string;
-    value_base.content_len = strlen(value_base_string);
-    ht_set(content_ht, key_base, &value_base);
+    content_ht = ht_create();
+
+    // walk the content directory and load each file in as a prepared response,
+    // keyed on the relative path
+    int ntfwt_rv = nftw(content_dir_path, load_content_file, 1000, 0);
+    check_error(ntfwt_rv, "nftw");
 }
 
 int main(int argc, char const *argv[])
@@ -618,8 +707,7 @@ int main(int argc, char const *argv[])
     // to prevent user-initiated filesystem interaction, and to avoid having to
     // worry about path cleaning, load all content into memory on startup, and
     // access via hash table keyed on HTTP request path.
-    ht *content_ht = ht_create();
-    load_content(content_ht);
+    load_content();
 
     // listen on all IPs
     int *listen_fds = NULL;
@@ -651,6 +739,7 @@ int main(int argc, char const *argv[])
     // shared vars we'll need in all loop iterations
     struct epoll_event epoll_events[EPOLL_MAX_EVENTS];
     void *client_buffer = malloc(CLIENT_BUFFER_LEN);
+    check_error_null(client_buffer, "client_buffer");
     struct itimerspec timeout_timerspec;
     memset(&timeout_timerspec, 0, sizeof timeout_timerspec);
     timeout_timerspec.it_value.tv_sec = SESSION_TIMEOUT_SEC;
@@ -791,7 +880,7 @@ int main(int argc, char const *argv[])
                     {
                         // we have the path. Try to send back the requested
                         // content
-                        generate_response(&(ed->session), content_ht);
+                        generate_response(&(ed->session));
                         send_response(fd, &(ed->session), epoll_events, i,
                                       epoll_fd);
                     }
@@ -838,12 +927,11 @@ int main(int argc, char const *argv[])
         }
     }
 
-    // not freeing listen_fds, client_buffer, or the session_t's of currently
-    // open listen or session sockets, for simplicity - the OS will reclaim when
-    // we exit. session_t's we're finished with during program execution are
-    // still cleaned up. This avoids having to maintain our own list of
-    // session_t pointers because I can't see a way to iterate over all
-    // remaining fds in an epoll instance's interest list.
+    // not freeing any global/singleton data for simplicity - the OS will
+    // reclaim when we exit. session_t's we're finished with during program
+    // execution are still cleaned up. This avoids having to maintain our own
+    // list of uh_epoll_data pointers because I can't see a way to iterate over
+    // all remaining fds in an epoll instance's interest list.
 
     return 0;
 }

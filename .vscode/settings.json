@@ -1,7 +1,15 @@
 {
     "files.associations": {
+        "*.json.liquid": "json",
+        "*.yaml.liquid": "yaml",
+        "*.md.liquid": "markdown",
+        "*.js.liquid": "liquid-javascript",
+        "*.css.liquid": "liquid-css",
+        "*.scss.liquid": "liquid-scss",
+        "*.html": "html",
         "netdb.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "timerfd.h": "c"
     },
     "makefile.configureOnOpen": false,
     "makefile.launchConfigurations": [
