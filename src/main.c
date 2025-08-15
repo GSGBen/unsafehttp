@@ -500,9 +500,10 @@ void rewrite_path(session_t *session)
 {
     if (session->request_path_len == 1 && session->request_path[0] == '/')
     {
-        static const char* index_path = "/index.html";
+        static const char *index_path = "/index.html";
         session->request_path_len = 11;
-        session->request_path = realloc(session->request_path, session->request_path_len);
+        session->request_path =
+            realloc(session->request_path, session->request_path_len);
         check_error_null(session->request_path, "rewrite_path realloc");
         memcpy(session->request_path, index_path, session->request_path_len);
     }
@@ -535,8 +536,9 @@ void generate_response(session_t *session)
     strncpy(null_term_path, session->request_path, session->request_path_len);
     null_term_path[session->request_path_len] = '\0';
 
+    // retrieve the content from the cached files in memory if the path matches
+    // a valid one
     content_t *content = ht_get(content_ht, null_term_path);
-    free(null_term_path);
 
     if (content == NULL)
     {
@@ -559,44 +561,70 @@ void generate_response(session_t *session)
 
         // prepare to convert content-length to str. calling snprintf like this
         // gives you the required string length of the converted value
-        int content_len_str_len =
-            snprintf(NULL, 0, "%zu", content->content_len);
+        int content_len_strlen = snprintf(NULL, 0, "%zu", content->content_len);
+        // + 1 for null terminator
+        char *content_len = malloc(content_len_strlen + 1);
+        sprintf(content_len, "%zu", content->content_len);
+
+        // determine the content type based on the file extension. Currently
+        // supports only a few. should probably hash-table these for speed too
+        char *content_type;
+        char *extension_separator = strrchr(null_term_path, '.');
+        // if a file ends with a . or has no extension, default to text/html
+        char *extension =
+            strlen(extension_separator) < 2 ? "html" : extension_separator + 1;
+        if (strcmp(extension, "jpeg") == 0 || strcmp(extension, "jpg") == 0)
+        {
+            content_type = "image/jpeg";
+        }
+        else if (strcmp(extension, "png") == 0)
+        {
+            content_type = "image/png";
+        }
+        else if (strcmp(extension, "css") == 0)
+        {
+            content_type = "text/css";
+        }
+        else
+        {
+            content_type = "text/html";
+        }
 
         // prepare each part of the response, calculate size and allocate space,
         // copy into the session data
 
-        static char *prefix = "HTTP/1.0 200 OK\r\n"
-                              "Server: unsafehttp\r\n"
-                              "Connection: close\r\n"
-                              "Content-Type: text/html\r\n"
-                              "Content-Length: ";
-        static char *middle = "\r\n"
-                              "\r\n";
+        static char *prefix_template = "HTTP/1.0 200 OK\r\n"
+                                       "Server: unsafehttp\r\n"
+                                       "Connection: close\r\n"
+                                       "Content-Type: %s\r\n"
+                                       "Content-Length: %s\r\n"
+                                       "\r\n";
+        int prefix_len = strlen(prefix_template) - 2 - 2 +
+                         strlen(content_type) + content_len_strlen;
+        // + 1 for sprintf's null terminator which we'll later overwrite
+        char *prefix = malloc(prefix_len + 1);
+        check_error_null(prefix, "malloc prefix");
+        sprintf(prefix, prefix_template, content_type, content_len);
 
-        session->response_len = strlen(prefix) + content_len_str_len +
-                                strlen(middle) + content->content_len;
-
+        session->response_len = prefix_len + content->content_len;
         session->response = malloc(session->response_len);
         check_error_null(session->response, "malloc session->response");
 
-        void *memcpy_rv = memcpy(session->response, prefix, strlen(prefix));
+        // copy in the prefix. this strips off the null terminator
+        void *memcpy_rv = memcpy(session->response, prefix, prefix_len);
         check_error_null(memcpy_rv, "generate_response 200 memcpy 1");
 
-        // +1 because snprintf will truncate to fit the null terminator. We'll
-        // overwrite it
-        snprintf((char *)session->response + strlen(prefix),
-                 content_len_str_len + 1, "%zu", content->content_len);
-
-        memcpy_rv =
-            memcpy(session->response + strlen(prefix) + content_len_str_len,
-                   middle, strlen(middle));
-        check_error_null(memcpy_rv, "generate_response 200 memcpy 2");
-
-        memcpy_rv = memcpy(session->response + strlen(prefix) +
-                               content_len_str_len + strlen(middle),
-                           content->content, content->content_len);
+        // then add the body. Already has no null terminator
+        memcpy_rv = memcpy(session->response + prefix_len, content->content,
+                           content->content_len);
         check_error_null(memcpy_rv, "generate_response 200 memcpy 3");
+
+        // free all our temp strings
+        free(content_len);
+        free(prefix);
     }
+
+    free(null_term_path);
 }
 
 /**
