@@ -224,6 +224,10 @@ void _log(const char *filename, int line, const char *message_fmt, ...)
         printf("\n");
     }
 
+    // it doesn't seem to love piping or redirecting output without this, even
+    // with the newlines above
+    fflush(stdout);
+
     free(time_str);
 }
 /**
