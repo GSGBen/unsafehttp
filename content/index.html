@@ -1,13 +1,77 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>Index</title>
-    <link rel="stylesheet" href="style.css">
-  </head>
-  <body>
-    <p>Index page</p>
-  </body>
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+  <title>Unsafe HTTP</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <div id="outer">
+    <div id="inner">
+      <marquee>
+        <h1 id="title">
+          Unsafe HTTP
+        </h1>
+      </marquee>
+      <p>
+        <a href="https://github.com/GSGBen/unsafehttp"><code>unsafehttp</code></a> is an extremely minimal HTTP server written in C
+        from scratch, to practice C, *nix socket programming, and C compilation.
+        It just served this webpage to you!
+      </p>
+      <p>
+        Yes, that's a marquee tag. Backward-compatibility is a beautiful thing.
+      </p>
+      <p>
+        You can find the source <a href="https://github.com/GSGBen/unsafehttp/blob/main/src/main.c">here</a>.
+      </p>
+
+      <h2>Hosting</h2>
+      <p>
+        It's running on a tiny Orange Pi SBC in my office:
+      </p>
+      <img src="orangepi.png">
+      <p>
+        There's no HTTP proxy between you, just a port-forward through my VPS.
+        You're <code>connect</code>ing right to the socket that the code is
+        <code>accept</code>ing on. 
+      </p>
+
+      <h2>Fun Stuff</h2>
+      <p>
+        To prevent user-initiated filesystem interaction, and to avoid having to
+        worry about path cleaning, <code>unsafehttp</code> loads all content
+        into a hash table in memory on startup, with the request/file paths as
+        keys and the file contents as values. Servicing a request is simply
+        looking up the content via the path. Any malicious paths
+        <span class="strike">will</span>should then just fail to find an entry.
+      </p>
+
+      <h2>HTTP Implementation</h2>
+      <p>
+        RFC 9112 is a fantastic document that details the exact format of HTTP
+        1.1 requests, how servers should respond to those requests, and is even
+        written in a way that would make implementing a full test suite a
+        reasonable task.
+      </p>
+      <p>
+        This server follows almost none of that.
+      </p>
+      <p>
+        In the interest of keeping this a fun and short side project, I've
+        implemented the very bare minimum for browsers to be able to send a
+        simple HTTP GET request to the server, and receive a response that lets
+        them render a webpage. Again in the interest of keeping this short, I'm
+        not even following the RFC exactly. Readers MUST NOT hold this against
+        the project, and SHOULD use this as motivation to keep some of their own
+        side projects fun and short.
+      </p>
+
+    </div>
+  </div>
+</body>
+
 </html>

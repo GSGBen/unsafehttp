@@ -1,6 +1,6 @@
 # unsafehttp
 
-Extremely minimal HTTP server implementation written in C, to practice C, \*nix
+*Extremely* minimal HTTP server written in C from scratch, to practice C, \*nix
 socket programming, C compilation.
 
 ## HTTP implementation
@@ -14,13 +14,15 @@ This server follows almost none of that.
 In the interest of keeping this a fun and short side project, I've implemented
 the very bare minimum for browsers to be able to send a simple HTTP GET request
 to the server, and receive a response that lets them render a webpage. Again in
-the interest of keeping this short, I'm not following the RFC exactly. Readers
-MUST NOT hold this against the project, and SHOULD use this as motivation to
-keep some of their own side projects fun and short.
+the interest of keeping this short, I'm not even following the RFC exactly.
+Readers MUST NOT hold this against the project, and SHOULD use this as
+motivation to keep some of their own side projects fun and short.
 
 ## Building
 
 Prereqs: standard gcc/buildtools things.
+
+Builds output to `build/`.
 
 ### Dev / testing
 

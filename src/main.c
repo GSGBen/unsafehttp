@@ -38,7 +38,6 @@
 // if we're waiting for more data from a connection and we don't receive any for
 // this many seconds, we'll close it.
 #define SESSION_TIMEOUT_SEC 5
-// return codes for try_parse_request_path().
 
 // to prevent user-initiated filesystem interaction, and to avoid having to
 // worry about path cleaning, load all content into memory on startup, and
@@ -52,6 +51,7 @@ char *content_dir_path;
 // verbose flag set by --verbose arg
 int verbose;
 
+// return codes for try_parse_request_path().
 typedef enum
 {
     // not enough data to determine the requested path yet
