@@ -37,7 +37,7 @@
 #define MAX_REQUEST_LINE_LENGTH 8000
 // if we're waiting for more data from a connection and we don't receive any for
 // this many seconds, we'll close it.
-#define SESSION_TIMEOUT_SEC 5
+#define SESSION_TIMEOUT_SEC 10
 
 // to prevent user-initiated filesystem interaction, and to avoid having to
 // worry about path cleaning, load all content into memory on startup, and
@@ -1099,6 +1099,9 @@ int main(int argc, char *argv[])
                 // we can now send more
                 else if (epoll_events[i].events & (EPOLLOUT))
                 {
+                    timerfd_settime(ed->session.timeout->fd, 0,
+                                    &timeout_timerspec, NULL);
+
                     uh_epoll_data *ed = epoll_events[i].data.ptr;
                     send_response(fd, &(ed->session), epoll_events, i,
                                   epoll_fd);
