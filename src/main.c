@@ -1118,7 +1118,7 @@ int main(int argc, char *argv[])
                 read(ed->timeout.fd, &_, sizeof _);
 
                 log("%s: timeout for timerfd %d and session fd %d hit",
-                    ed->session.client_addr, fd, ed->timeout.session->fd);
+                    ed->timeout.session->client_addr, fd, ed->timeout.session->fd);
 
                 close_session(ed->timeout.session, epoll_fd);
             }
