@@ -9,7 +9,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <getopt.h>
 #include <netdb.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +20,6 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <getopt.h>
 
 // max number of incoming connections the kernel will buffer
 #define BACKLOG 10
@@ -47,6 +48,9 @@
 ht *content_ht;
 // same, needs to be global for the callback
 char *content_dir_path;
+
+// verbose flag set by --verbose arg
+int verbose;
 
 typedef enum
 {
@@ -86,7 +90,8 @@ typedef struct timeout_t timeout_t;
  *
  * use session_new() / session_delete().
  *
- * Strings are not NUL-terminated, use the related length var.
+ * Most strings (except client_addr, for simplicity, and which we control) are
+ * not NUL-terminated, use the related length var.
  */
 typedef struct
 {
@@ -97,6 +102,9 @@ typedef struct
     // storage is a union, so we have to re-include it now that we're asking
     // epoll to track custom data for us.
     int fd;
+
+    // text representation of the source adress. nul-terminated.
+    char client_addr[INET6_ADDRSTRLEN];
 
     // the HTTP request text.
     char *request;
@@ -184,6 +192,54 @@ typedef struct
     size_t content_len;
 } content_t;
 
+void _log(const char *filename, int line, const char *message_fmt, ...)
+{
+    // get the current yyyy-MM-dd hh:mm:ss timestamp
+    time_t now;
+    time(&now);
+    struct tm *localnow = localtime(&now);
+    char *time_str = malloc(20);
+    strftime(time_str, 20, "%F %T", localnow);
+
+    // prefix the timestamp. in verbose mode, we print the code location as well
+    if (verbose)
+    {
+        printf("[%s] %s:%d: ", time_str, filename, line);
+    }
+    else
+    {
+        printf("[%s]: ", time_str);
+    }
+    // add the user's message. This is how you access variadic arguments in a C
+    // function. Note vprintf, not printf. could have left this whole function
+    // in the macro with __VA_ARGS__ and skipped this too
+    va_list args;
+    va_start(args, message_fmt);
+    vprintf(message_fmt, args);
+    va_end(args);
+    // add a trailing newline if required
+    int message_fmt_len = strlen(message_fmt);
+    if (message_fmt_len > 0 && message_fmt[message_fmt_len - 1] != '\n')
+    {
+        printf("\n");
+    }
+
+    free(time_str);
+}
+/**
+ * wraps printf(), automatically prepends the timestamp, and in verbose mode,
+ * the source file and line. automatically adds a trailing newline if required.
+ */
+#define log(message_fmt, ...)                                                  \
+    _log(__FILE__, __LINE__, message_fmt, ##__VA_ARGS__)
+
+/**
+ * like log(), but only prints in verbose mode.
+ */
+#define log_verbose(message_fmt, ...)                                          \
+    if (verbose)                                                               \
+    _log(__FILE__, __LINE__, message_fmt, ##__VA_ARGS__)
+
 /**
  * If return_value is -1, prints "<prefix>: <string description of errno>" then
  * exits with a return code of 1.
@@ -195,7 +251,7 @@ void check_error(int return_value, const char *prefix)
         // using this instead of perror so that we can get it into stdout
         // instead of stderr, to maintain log ordering. Otherwise buffering can
         // put things confusingly out of order
-        printf("%s: %s\n", prefix, strerror(errno));
+        log("%s: %s\n", prefix, strerror(errno));
         exit(1);
     }
 }
@@ -207,7 +263,7 @@ void check_error_gai(int return_value, const char *prefix)
 {
     if (return_value != 0)
     {
-        printf("%s: %s\n", prefix, gai_strerror(return_value));
+        log("%s: %s\n", prefix, gai_strerror(return_value));
         exit(1);
     }
 }
@@ -219,7 +275,7 @@ void check_error_null(void *return_value, const char *prefix)
 {
     if (return_value == NULL)
     {
-        printf("%s: %s\n", prefix, strerror(errno));
+        log("%s: %s\n", prefix, strerror(errno));
         exit(1);
     }
 }
@@ -231,13 +287,13 @@ void print_if_error(int return_value, const char *prefix)
 {
     if (return_value == -1)
     {
-        printf("%s: %s\n", prefix, strerror(errno));
+        log("%s: %s\n", prefix, strerror(errno));
     }
 }
 
 /**
- * Use to construct all session_t's. Allocates and
- * initializes.
+ * Use to construct all session_t's. Allocates and initializes. Only allocates
+ * the struct itself, none of the containing pointers.
  */
 uh_epoll_data *session_new()
 {
@@ -258,7 +314,8 @@ uh_epoll_data *session_new()
 }
 
 /**
- * Deallocates all memory for session. Doesn't deallocate timeout.
+ * Deallocates all memory for session, including memory referenced by containing
+ * pointers. Except it doesn't deallocate timeout.
  */
 void session_delete(session_t *session)
 {
@@ -334,6 +391,34 @@ void addrinfo_ip_str(const struct addrinfo *in_addrinfo, char *out_str,
 }
 
 /**
+ * Returns in out_str, the IP referenced by in_sockaddr. out_str should be `char
+ * example[INET6_ADDRSTRLEN]` to fit an IPv6 address.
+ *
+ * Copied from Beej's guide
+ */
+void sockaddr_ip_str(const struct sockaddr_storage *in_sockaddr, char *out_str,
+                     int out_str_len)
+{
+    void *addr;
+    struct sockaddr_in *ipv4;
+    struct sockaddr_in6 *ipv6;
+
+    // get the pointer to the address itself, different fields in IPv4 and IPv6:
+    if (in_sockaddr->ss_family == AF_INET)
+    { // IPv4
+        ipv4 = (struct sockaddr_in *)in_sockaddr;
+        addr = &(ipv4->sin_addr);
+    }
+    else
+    { // IPv6
+        ipv6 = (struct sockaddr_in6 *)in_sockaddr;
+        addr = &(ipv6->sin6_addr);
+    }
+
+    inet_ntop(in_sockaddr->ss_family, addr, out_str, out_str_len);
+}
+
+/**
  * Prints len chars from buffer to stdout. wraps in newlines and `==========`
  * separators. the start and end content is immediately delimited by `||`.
  *
@@ -345,11 +430,9 @@ void print_buffer(void *buffer, int len)
     // %.*s is the format to
     // print a specific number of a characters, instead of a
     // NUL-terminated string
-    printf("\n==========\n||");
-    printf("%.*s", len, (char *)buffer);
-    printf("||\n==========\n\n");
-    // force printf to actually output, without appending a \n
-    fflush(stdout);
+    log("\n==========\n||");
+    log("%.*s", len, (char *)buffer);
+    log("||\n==========\n\n");
 }
 
 // run through all the syscalls to get us to a point where we're listening on a
@@ -359,7 +442,8 @@ void print_buffer(void *buffer, int len)
 // wildcard IPs - so all), but currently only returns one: it turns out that if
 // you request to listen on the IPv6 wildcard address with the default settings,
 // it's dual-stack anyway.
-void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len, const char *port)
+void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len,
+                           const char *port)
 {
     // detail our desired bind type, and get results back about what we can
     // potentially bind to
@@ -394,7 +478,6 @@ void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len, const 
         // was defined. and `sizeof <array>` instead of `sizeof <array> * sizeof
         // <array type>` only works because `sizeof char` is 1 anyway.
         addrinfo_ip_str(result, ipstr, sizeof ipstr);
-        printf("attempting to listen on %s\n", ipstr);
 
         int socket_fd =
             socket(result->ai_family, result->ai_socktype, result->ai_protocol);
@@ -421,7 +504,7 @@ void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len, const 
         check_error_null(*out_listen_fds, "realloc out_listen_fds");
         (*out_listen_fds)[*out_listen_fds_len - 1] = socket_fd;
 
-        printf("listening on %s\n", ipstr);
+        log("listening on IP %s on port %s on fd %d", ipstr, port, socket_fd);
     }
 
     freeaddrinfo(results);
@@ -433,7 +516,7 @@ void create_listen_sockets(int **out_listen_fds, int *out_listen_fds_len, const 
  */
 void close_session(session_t *session, int epoll_fd)
 {
-    printf("closing session fd %d\n", session->fd);
+    log("%s: closing session fd %d", session->client_addr, session->fd);
     int ectl_rv = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, session->fd, NULL);
     check_error(ectl_rv, "close_session epoll_ctl");
     close(session->fd);
@@ -515,7 +598,7 @@ void generate_response(session_t *session)
 {
     if (session->request_len == 0)
     {
-        printf("generate_response(): request_len is 0\n");
+        log("%s: generate_response(): request_len is 0", session->client_addr);
         return;
     }
 
@@ -541,6 +624,9 @@ void generate_response(session_t *session)
     if (content == NULL)
     {
         // content not found, return a 404
+
+        log("%s: content for path %s not found, returning 404",
+            session->client_addr, null_term_path);
         static char *fof = "HTTP/1.0 404 Not Found\r\n"
                            "Server: unsafehttp\r\n"
                            "Connection: close\r\n"
@@ -556,6 +642,9 @@ void generate_response(session_t *session)
     else
     {
         // found some content to return. construct a response and send it.
+
+        log("%s: content for path %s found, returning it with 200",
+            session->client_addr, null_term_path);
 
         // prepare to convert content-length to str. calling snprintf like this
         // gives you the required string length of the converted value
@@ -652,7 +741,8 @@ void send_response(int fd, session_t *session, struct epoll_event *epoll_events,
             // block
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                printf("got EAGAIN or EWOULDBLOCK\n");
+                log_verbose("%s: got EAGAIN or EWOULDBLOCK",
+                            session->client_addr);
                 // if it is, then ask epoll to tell us when we can write again
                 epoll_events[i].events |= EPOLLOUT;
                 int ectl_rv =
@@ -673,13 +763,18 @@ void send_response(int fd, session_t *session, struct epoll_event *epoll_events,
             // we sent some data. track it, then let the loop try again if
             // required
             session->response_sent_len += num_bytes_sent;
-            printf("sent %d bytes\n", num_bytes_sent);
+            log_verbose("%s: sent %d bytes", session->client_addr,
+                        num_bytes_sent);
         }
     }
 
     // if we've sent everything, we're done with this session
     if (session->response_sent_len == session->response_len)
+    {
+        log("%s: sent full response of %d bytes, closing session.",
+            session->client_addr, session->response_sent_len);
         close_session(session, epoll_fd);
+    }
 }
 
 /**
@@ -692,7 +787,8 @@ int load_content_file(const char *fpath, const struct stat *sb, int typeflag,
     if (typeflag != FTW_F)
         return 0;
 
-    printf("lcf: %s, %d, %d\n", fpath, ftwbuf->base, ftwbuf->level);
+    log("load content file: path: %s, size: %d, base (len): %d, level: %d",
+        fpath, sb->st_size, ftwbuf->base, ftwbuf->level);
 
     // read the file into memory, and pre-prepare a HTTP response based on it.
     // global/singleton data - not freeing. See end of main().
@@ -750,12 +846,12 @@ int main(int argc, char *argv[])
     // https://www.gnu.org/software/libc/manual/html_node/Getopt-Long-Option-Example.html
     // and the previous page it links to. Better descriptions than the man page
     // in this case.
-    char *port;
+    char *port = NULL;
     static struct option long_options[] = {
         {"port", required_argument, NULL, 'p'},
         {"content-path", required_argument, NULL, 'c'},
-        {0,0,0,0}
-    };
+        {"verbose", no_argument, &verbose, 1},
+        {0, 0, 0, 0}};
     while (1)
     {
         int option_index = 0;
@@ -768,9 +864,8 @@ int main(int argc, char *argv[])
         else if (c == 'p')
         {
             // port
-            
+
             // the actual argument is stored in a gloal defined elsewhere
-            printf("%s\n", optarg);
             // +1 for nul-terminator
             port = malloc(strlen(optarg) + 1);
             check_error_null(port, "malloc content_dir_path");
@@ -786,12 +881,12 @@ int main(int argc, char *argv[])
     }
     if (content_dir_path == NULL)
     {
-        printf("`--content-path <path>` is a required argument\n");
+        log("`--content-path <path>` is a required argument");
         exit(1);
     }
     if (port == NULL)
     {
-        printf("`--port <port to listen on>` is a required argument\n");
+        log("`--port <port to listen on>` is a required argument");
         exit(1);
     }
 
@@ -859,7 +954,8 @@ int main(int argc, char *argv[])
                 check_error(connection_fd, "accept");
 
                 // make non-blocking
-                fcntl(connection_fd, F_SETFL, O_NONBLOCK);
+                int fcntl_rv = fcntl(connection_fd, F_SETFL, O_NONBLOCK);
+                check_error(fcntl_rv, "accept fcntl non-blocking");
 
                 // have epoll notify us when there's something to do on the
                 // connection
@@ -896,8 +992,11 @@ int main(int argc, char *argv[])
                 // tracking a pointer for us so can still set this here
                 ed->session.timeout = &edt->timeout;
 
-                printf("got new connection fd %d via listen fd %d\n",
-                       connection_fd, fd);
+                sockaddr_ip_str(&their_addr, ed->session.client_addr,
+                                INET6_ADDRSTRLEN);
+
+                log("%s: new connection on fd %d (via listen fd %d)",
+                    ed->session.client_addr, connection_fd, fd);
             }
             else if (fd_type == EPT_CONNECTION)
             {
@@ -931,6 +1030,7 @@ int main(int argc, char *argv[])
                     int socket_closed = num_bytes_recvd == 0;
                     if (socket_closed)
                     {
+                        log("%s: socket closed", ed->session.client_addr);
                         close_session(&ed->session, epoll_fd);
                         continue;
                     }
@@ -956,15 +1056,21 @@ int main(int argc, char *argv[])
                         try_parse_request_path(&(ed->session));
                     if (parse_result == TPRP_NEEDMOREDATA)
                     {
-                        printf("need more data. So far: %.*s\n",
-                               (int)(ed->session.request_len),
-                               ed->session.request);
+                        log_verbose("%s: TPRP needs more data. So far: %.*s",
+                                    ed->session.client_addr,
+                                    (int)(ed->session.request_len),
+                                    ed->session.request);
                         // need more data. Wait for next packet
                     }
                     else if (parse_result == TPRP_NOPREFIX ||
                              parse_result == TPRP_TOOLONG)
                     {
                         // bad request, close.
+                        log("%s: bad request, closing. TPRP: %d. Request path: "
+                            "%.*s",
+                            ed->session.client_addr, parse_result,
+                            (int)(ed->session.request_len),
+                            ed->session.request);
                         close_session(&ed->session, epoll_fd);
                     }
                     else if (parse_result == TPRP_PARSED)
@@ -978,8 +1084,8 @@ int main(int argc, char *argv[])
                     }
                     else
                     {
-                        printf("unhandled TPRP_ parse result: %d\n",
-                               parse_result);
+                        log("%s: unhandled TPRP_ parse result: %d",
+                            ed->session.client_addr, parse_result);
                     }
 
                     // show contents for debugging
@@ -996,8 +1102,8 @@ int main(int argc, char *argv[])
                 // a hangup or error
                 else
                 {
-                    printf("hangup or error on fd %d: %d", fd,
-                           epoll_events[i].events);
+                    log("%s: hangup or error on fd %d: %d",
+                        ed->session.client_addr, fd, epoll_events[i].events);
                     // clean up
                     close_session(&ed->session, epoll_fd);
                 }
@@ -1011,8 +1117,8 @@ int main(int argc, char *argv[])
                 uint64_t _;
                 read(ed->timeout.fd, &_, sizeof _);
 
-                printf("timeout for timerfd %d and session fd %d hit\n", fd,
-                       ed->timeout.session->fd);
+                log("%s: timeout for timerfd %d and session fd %d hit",
+                    ed->session.client_addr, fd, ed->timeout.session->fd);
 
                 close_session(ed->timeout.session, epoll_fd);
             }
